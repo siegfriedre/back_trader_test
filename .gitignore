@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 .yf_cache/
 data/verified/
+data/research/
