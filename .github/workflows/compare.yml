@@ -1,0 +1,38 @@
+name: Offline strategy comparison
+on:
+  push:
+    branches: [feat/research-preinception-data]
+    paths:
+      - 'backtest/**'
+      - 'run_comparison.py'
+      - 'tests/test_comparison.py'
+      - 'requirements-backtest.txt'
+      - '.github/workflows/compare.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-backtest.txt
+      - name: Regression tests (invented fixtures, not market prices)
+        run: python -m unittest discover -s tests -v
+      - name: Compare existing CSVs (explicitly unverified legacy adjustment assumption)
+        run: python run_comparison.py --accept-legacy-adjusted
+      - name: Publish auditable results, including a failed manifest on data errors
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: strategy-comparison-${{ github.sha }}
+          path: results/comparisons/
+          if-no-files-found: warn
+          retention-days: 14

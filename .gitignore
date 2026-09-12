@@ -4,3 +4,4 @@ __pycache__/
 .yf_cache/
 data/verified/
 data/research/
+results/

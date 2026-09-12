@@ -1,0 +1,6 @@
+# Offline comparison only. Python 3.11 or 3.12 recommended.
+# Same numeric/calendar pins as the existing observed-data pipeline.
+numpy==2.3.5
+pandas==2.2.3
+exchange-calendars==4.11.1
+tzdata==2025.2
