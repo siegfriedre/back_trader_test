@@ -1,230 +1,386 @@
+"""Observed daily bars with provenance checks and fail-closed snapshot publication.
+
+No proxy histories or missing-price fills. Consistency checks are not an
+independent guarantee of the data vendor's accuracy.
+"""
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from datetime import date, datetime, timezone
+import hashlib
+from importlib.metadata import version
+import json
 import os
-import yfinance as yf
-import pandas as pd
+from pathlib import Path
+import sys
+import time
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
 import numpy as np
+import pandas as pd
 
-# 创建数据存储目录
-os.makedirs('data', exist_ok=True)
-os.makedirs('data/raw', exist_ok=True) # 新增：原始数据目录
-
-# yfinance 缓存目录放到项目内，避免系统缓存目录不可写（沙箱/权限问题）
-yf.set_tz_cache_location(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.yf_cache'))
-
-# 拟合起点：1999年QQQ上市
-START_DATE = "1999-03-10"
-
-print("开始通过直连通道下载真实数据及替代品数据...")
-# 定义需要的实际标的和替代标的（已用 SPY 替代 VOO）
-tickers = {
-    "QQQ": "QQQ",
-    "SPY": "SPY",   # SPY 历史足够长，直接作为目标标的，无需拟合
-    "QLD": "QLD",
-    "TQQQ": "TQQQ",
-    "SGOV": "SGOV",
-    "VIX": "^VIX", 
-    "BIL": "BIL",   # 用于回填 SGOV (2007-2020)
-    "IRX": "^IRX",  # 用于回填 SGOV 早期利率 (1999-2007)
-    "VOO": "VOO",   # 与 SPY 同指数，用于更新历史 VOO 文件
-    "VIVAX": "VIVAX",  # 用于回填 VTV/SCHD/VYM 的早期历史 (1992 年起)
-    "VYM": "VYM",      # 用于回填 SCHD (2006-2011)
-    "SCHD": "SCHD",
-    "VTV": "VTV",
-    "CGDV": "CGDV",
-    "KO": "KO"
+ROOT = Path(__file__).resolve().parent
+DEFAULT_OUTPUT = ROOT / "data" / "verified"
+SYMBOLS = {
+    "QQQ": "QQQ", "SPY": "SPY", "QLD": "QLD", "TQQQ": "TQQQ",
+    "SGOV": "SGOV", "VIX": "^VIX", "VOO": "VOO", "VTV": "VTV",
+    "SCHD": "SCHD", "CGDV": "CGDV", "KO": "KO",
 }
+OHLC = ["Open", "High", "Low", "Close"]
+REQUIRED = OHLC + ["Adj Close", "Volume", "Dividends", "Stock Splits"]
+INDICATORS = ["RSI_6", "RSI_14", "MA_5", "MA_10", "MA_120", "MA_200"]
+HISTORY_OPTIONS = dict(
+    interval="1d", auto_adjust=False, back_adjust=False, actions=True,
+    repair=False, keepna=True, prepost=False, rounding=False,
+    raise_errors=True, timeout=30,
+)
+SCHEMA = 1
 
-raw_data = {}
-for name, ticker in tickers.items():
-    print(f"正在下载 {name} ({ticker})...")
+
+class DataValidationError(ValueError):
+    """The requested data contract cannot be satisfied."""
+
+
+def ny_today() -> date:
+    return datetime.now(ZoneInfo("America/New_York")).date()
+
+
+def dates(start: str, end: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+    left, right = pd.Timestamp(date.fromisoformat(start)), pd.Timestamp(date.fromisoformat(end))
+    if left >= right or right.date() > ny_today():
+        raise DataValidationError("Require start < end <= today's New York date (end exclusive).")
+    return left, right
+
+
+def trading_sessions(start: str, end: str) -> pd.DatetimeIndex:
+    import exchange_calendars as xcals
+
+    left, right = dates(start, end)
+    # US equity sessions, including holidays/exceptional closures, also for VIX signals.
+    cal = xcals.get_calendar("XNYS", start=left, end=right)
+    sessions = cal.sessions[(cal.sessions >= left) & (cal.sessions < right)]
+    if sessions.empty:
+        raise DataValidationError("The requested interval has no equity trading sessions.")
+    return sessions
+
+
+def normalize_daily(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        raise DataValidationError("Provider returned no bars.")
+    df = frame.copy()
+    if isinstance(df.columns, pd.MultiIndex) or df.columns.has_duplicates:
+        raise DataValidationError("Expected unique single-ticker columns.")
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise DataValidationError("Expected a daily DatetimeIndex.")
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert("America/New_York").tz_localize(None)
+    if df.index.hasnans or not df.index.equals(df.index.normalize()):
+        raise DataValidationError("Invalid or intraday timestamps in daily data.")
+    if df.index.has_duplicates or not df.index.is_monotonic_increasing:
+        raise DataValidationError("Duplicate or unsorted dates; refusing silent deduplication.")
+    df.index.name = "Date"
+    return df
+
+
+def validate_ohlc(df: pd.DataFrame, *, index_instrument: bool = False) -> None:
+    if not set(OHLC + ["Volume"]).issubset(df.columns):
+        raise DataValidationError("Missing OHLCV columns.")
+    if not np.isfinite(df[OHLC + ["Volume"]].to_numpy(dtype=float)).all():
+        raise DataValidationError("Missing/non-finite OHLCV data.")
+    if (df[OHLC] <= 0).any().any():
+        raise DataValidationError("Non-positive prices.")
+    if (df.Volume < 0).any() or (not index_instrument and (df.Volume == 0).any()):
+        raise DataValidationError("Non-tradable zero-volume bar or negative volume.")
+    tolerance = df[OHLC].abs().max(axis=1) * 1e-6
+    bad = df.High + tolerance < df[["Open", "Close", "Low"]].max(axis=1)
+    bad |= df.Low - tolerance > df[["Open", "Close", "High"]].min(axis=1)
+    if bad.any():
+        raise DataValidationError(f"Inconsistent OHLC on {df.index[bad][0].date()}.")
+
+
+def first_trade_date(metadata: dict, symbol: str) -> pd.Timestamp:
+    expected_type = "INDEX" if symbol == "^VIX" else ("EQUITY" if symbol == "KO" else "ETF")
+    if metadata.get("symbol") != symbol or metadata.get("currency") != "USD":
+        raise DataValidationError(f"Unexpected symbol/currency metadata for {symbol}.")
+    if metadata.get("instrumentType") != expected_type:
+        raise DataValidationError(f"Unexpected instrument type for {symbol}.")
+    tz = metadata.get("exchangeTimezoneName")
+    if tz not in {"America/New_York", "US/Eastern"}:
+        raise DataValidationError(f"Unrecognized exchange timezone: {tz}.")
+    first = metadata.get("firstTradeDate")
+    if first is None or isinstance(first, bool):
+        raise DataValidationError("Missing firstTradeDate; cannot check leading gaps.")
+    timestamp = (pd.Timestamp(first, unit="s", tz="UTC") if isinstance(first, (int, float))
+                 else pd.Timestamp(first))
+    if pd.isna(timestamp) or timestamp.tz is None:
+        raise DataValidationError("firstTradeDate must include a timezone.")
+    return timestamp.tz_convert(tz).tz_localize(None).normalize()
+
+
+def validate_raw(df: pd.DataFrame, metadata: dict, symbol: str,
+                 sessions: pd.DatetimeIndex) -> pd.Timestamp:
+    missing = set(REQUIRED) - set(df.columns)
+    if missing:
+        raise DataValidationError(f"Missing provider fields: {sorted(missing)}.")
+    if not np.isfinite(df[REQUIRED].to_numpy(dtype=float)).all():
+        raise DataValidationError("Null/non-finite provider fields; refusing to fill them.")
+    if (df["Adj Close"] <= 0).any() or (df[["Dividends", "Stock Splits"]] < 0).any().any():
+        raise DataValidationError("Invalid adjustment or corporate-action data.")
+    if "Capital Gains" in df:
+        gains = df["Capital Gains"].to_numpy(dtype=float)
+        if not np.isfinite(gains).all() or (gains < 0).any():
+            raise DataValidationError("Invalid capital-gains distribution data.")
+    validate_ohlc(df, index_instrument=symbol == "^VIX")
+    first = first_trade_date(metadata, symbol)
+    expected = sessions[sessions >= first]
+    absent, extra = expected.difference(df.index), df.index.difference(expected)
+    if expected.empty or len(absent) or len(extra):
+        raise DataValidationError(
+            f"{symbol}: session mismatch; missing={absent.strftime('%Y-%m-%d').tolist()[:8]}, "
+            f"unexpected={extra.strftime('%Y-%m-%d').tolist()[:8]}."
+        )
+    if len(df) < 200:
+        raise DataValidationError(f"{symbol}: only {len(df)} real bars; MA200 needs at least 200.")
+    return first
+
+
+def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder RSI: initial simple mean, then recursive smoothing; flat series = 50."""
+    result = pd.Series(np.nan, index=series.index, dtype=float)
+    if len(series) <= period:
+        return result
+    change = series.diff()
+    up, down = change.clip(lower=0), -change.clip(upper=0)
+    gain, loss = up.iloc[1:period + 1].mean(), down.iloc[1:period + 1].mean()
+    for i in range(period, len(series)):
+        if i > period:
+            gain = (gain * (period - 1) + up.iloc[i]) / period
+            loss = (loss * (period - 1) + down.iloc[i]) / period
+        result.iloc[i] = (50.0 if gain == loss == 0 else
+                          100.0 if loss == 0 else 100.0 - 100.0 / (1.0 + gain / loss))
+    return result
+
+
+def adjusted_daily(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    df = raw[OHLC + ["Volume"]].copy()
+    factor = raw["Adj Close"] / raw["Close"]
+    df[OHLC] = df[OHLC].mul(factor, axis=0)
+    df["AdjustmentFactor"] = factor
+    validate_ohlc(df, index_instrument=symbol == "^VIX")
+    for period in (6, 14):
+        df[f"RSI_{period}"] = calculate_rsi(df.Close, period)
+    for period in (5, 10, 120, 200):
+        df[f"MA_{period}"] = df.Close.rolling(period).mean()
+    # Preserve all real warm-up rows, rather than discarding dates or fabricating history.
+    df["IndicatorsReady"] = df[INDICATORS].notna().all(axis=1)
+    df["IsSynthetic"] = False
+    return df
+
+
+def fetch_yahoo(symbol: str, start: str, end: str) -> tuple[pd.DataFrame, dict]:
+    import yfinance as yf
+
+    yf.set_tz_cache_location(str(ROOT / ".yf_cache"))
+    last_error = None
+    for attempt in range(3):
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(start=start, end=end, **HISTORY_OPTIONS)
+            if df is None or df.empty:
+                raise DataValidationError(f"{symbol}: empty download.")
+            return df, ticker.get_history_metadata()
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(attempt + 1)
+    raise DataValidationError(f"{symbol}: download failed after 3 attempts: {last_error}")
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def atomic_json(path: Path, content: dict) -> None:
+    temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
-        df = yf.download(ticker, start=START_DATE)
-        if not df.empty:
-            # 扁平化多级索引
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            
-            # 1. 【新增要求】第一时间保存最原始的下载数据
-            raw_file_path = f"data/raw/{name}_raw.csv"
-            df.to_csv(raw_file_path)
-            
-            # 自适应提取列名逻辑
-            if 'Adj Close' in df.columns:
-                df = df[['Open', 'High', 'Low', 'Adj Close', 'Volume']].copy()
-                df.rename(columns={'Adj Close': 'Close'}, inplace=True)
-            else:
-                df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-            
-            raw_data[name] = df
-            print(f"-> {name} 下载并保存原始数据成功，共 {len(df)} 行。")
+        with temp.open("w", encoding="utf-8") as stream:
+            json.dump(content, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+@contextmanager
+def snapshot_lock(root: Path):
+    root.mkdir(parents=True, exist_ok=True)
+    lock = root / ".download.lock"
+    try:
+        stream = lock.open("x", encoding="utf-8")
+    except FileExistsError as exc:
+        raise DataValidationError("Another run owns .download.lock; check it before retrying.") from exc
+    try:
+        with stream:
+            stream.write(str(os.getpid()))
+        yield
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def create_snapshot(start: str, end: str, names: list[str],
+                    output_root: Path = DEFAULT_OUTPUT) -> Path:
+    dates(start, end)
+    if not names or len(names) != len(set(names)) or set(names) - SYMBOLS.keys():
+        raise DataValidationError("Select unique supported symbols.")
+    root = Path(output_root)
+    with snapshot_lock(root):
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid4().hex[:12]
+        run = root / "runs" / run_id
+        run.mkdir(parents=True)
+        pointer = {"schema": SCHEMA, "run_id": run_id, "status": "downloading"}
+        # Invalidate the reader BEFORE downloading. An old batch is never a fallback.
+        atomic_json(root / "latest.json", pointer)
+        manifest = {
+            "schema": SCHEMA, "run_id": run_id, "status": "downloading",
+            "source": "Yahoo Finance via yfinance", "independently_verified": False,
+            "start_inclusive": start, "end_exclusive": end, "requested_symbols": names,
+            "history_options": HISTORY_OPTIONS, "calendar": "XNYS",
+            "adjustment": "All OHLC multiplied by provider Adj Close / Close; volume unchanged",
+            "contains_synthetic": False, "files": {}, "instruments": {},
+        }
+        try:
+            manifest["versions"] = {name: version(name) for name in
+                                    ("yfinance", "pandas", "numpy", "exchange-calendars")}
+            manifest["python"] = sys.version.split()[0]
+            manifest["script_sha256"] = sha256(Path(__file__))
+            sessions = trading_sessions(start, end)
+            for name in names:
+                symbol = SYMBOLS[name]
+                print(f"Downloading and checking {name} ({symbol})...", flush=True)
+                response, metadata = fetch_yahoo(symbol, start, end)
+                fetched_at = datetime.now(timezone.utc).isoformat()
+                raw_path = run / "raw" / f"{name}.csv"
+                raw_path.parent.mkdir(exist_ok=True)
+                # Save the provider-returned table before normalization/validation.
+                response.to_csv(raw_path, index_label="Date")
+                metadata_path = run / "raw" / f"{name}.metadata.json"
+                metadata_path.write_text(json.dumps(metadata, default=str, ensure_ascii=False,
+                                                   indent=2), encoding="utf-8")
+                raw = normalize_daily(response)
+                first = validate_raw(raw, metadata, symbol, sessions)
+                adjusted = adjusted_daily(raw, symbol)
+                adjusted_path = run / "adjusted" / f"{name}.csv"
+                adjusted_path.parent.mkdir(exist_ok=True)
+                adjusted.to_csv(adjusted_path, index_label="Date", date_format="%Y-%m-%d")
+                for path in (raw_path, metadata_path, adjusted_path):
+                    manifest["files"][path.relative_to(run).as_posix()] = sha256(path)
+                ready = adjusted.index[adjusted.IndicatorsReady]
+                manifest["instruments"][name] = {
+                    "symbol": symbol, "fetched_at_utc": fetched_at, "rows": len(raw),
+                    "provider_first_trade_date": first.date().isoformat(),
+                    "first_date": raw.index[0].date().isoformat(),
+                    "last_date": raw.index[-1].date().isoformat(),
+                    "indicators_ready_from": ready[0].date().isoformat(),
+                    "tradable": name != "VIX",
+                }
+            manifest["common_indicators_start"] = max(
+                item["indicators_ready_from"] for item in manifest["instruments"].values())
+            manifest["status"] = "passed"
+            manifest["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+            atomic_json(run / "manifest.json", manifest)
+            pointer.update(status="passed", manifest_sha256=sha256(run / "manifest.json"))
+            atomic_json(root / "latest.json", pointer)
+        except BaseException as exc:
+            # Also invalidate on Ctrl+C; a killed process leaves status=downloading (blocked).
+            pointer.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+            atomic_json(root / "latest.json", pointer)
+            manifest.update(status="failed", error=pointer["error"])
+            atomic_json(run / "manifest.json", manifest)
+            raise
+    return run
+
+
+def load_verified_data(names: list[str], *, end: str,
+                       output_root: Path = DEFAULT_OUTPUT) -> dict[str, pd.DataFrame]:
+    """Backtest gate: explicit cutoff, whole-batch integrity, no legacy fallback.
+
+    Returns adjusted OHLC and warm-up rows. Check IndicatorsReady for signals;
+    VIX is a signal input, not a tradable security.
+    """
+    root = Path(output_root)
+    if not names or len(names) != len(set(names)) or set(names) - SYMBOLS.keys():
+        raise DataValidationError("Select unique supported symbols.")
+    try:
+        pointer_bytes = (root / "latest.json").read_bytes()
+        pointer = json.loads(pointer_bytes)
+        if pointer.get("schema") != SCHEMA or pointer.get("status") != "passed":
+            raise DataValidationError("Latest data preparation did not pass; backtest blocked.")
+        run_id = pointer["run_id"]
+        if not isinstance(run_id, str) or Path(run_id).name != run_id or run_id in {".", ".."}:
+            raise DataValidationError("Invalid snapshot path.")
+        run = root / "runs" / run_id
+        if sha256(run / "manifest.json") != pointer["manifest_sha256"]:
+            raise DataValidationError("Snapshot manifest checksum mismatch.")
+        manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+        if (manifest.get("schema") != SCHEMA or manifest.get("status") != "passed"
+                or manifest.get("contains_synthetic") is not False
+                or manifest.get("run_id") != run_id):
+            raise DataValidationError("Unapproved snapshot contract.")
+        if manifest["end_exclusive"] != end:
+            raise DataValidationError("Requested end date differs from snapshot; refusing stale data.")
+        dates(manifest["start_inclusive"], end)
+        available = manifest["requested_symbols"]
+        if not available or set(available) - SYMBOLS.keys() or set(names) - set(available):
+            raise DataValidationError("Snapshot is missing requested instruments.")
+        expected_files = {f"{folder}/{name}{suffix}" for name in available for folder, suffix in
+                          (("raw", ".csv"), ("raw", ".metadata.json"), ("adjusted", ".csv"))}
+        if set(manifest["files"]) != expected_files:
+            raise DataValidationError("Snapshot file inventory is incomplete.")
+        for relative, expected_hash in manifest["files"].items():
+            if sha256(run / relative) != expected_hash:
+                raise DataValidationError(f"Data checksum mismatch: {relative}.")
+        result = {}
+        for name in names:
+            df = pd.read_csv(run / "adjusted" / f"{name}.csv", index_col="Date", parse_dates=["Date"])
+            df = normalize_daily(df)
+            validate_ohlc(df, index_instrument=name == "VIX")
+            if not df.IsSynthetic.eq(False).all() or not df.IndicatorsReady.any():
+                raise DataValidationError(f"Invalid synthetic/warm-up markers: {name}.")
+            result[name] = df
+        if pointer_bytes != (root / "latest.json").read_bytes():
+            raise DataValidationError("Snapshot changed while loading; retry against a stable run.")
+        return result
+    except (OSError, KeyError, TypeError, AttributeError, ValueError) as exc:
+        if isinstance(exc, DataValidationError):
+            raise
+        raise DataValidationError(f"Cannot load a complete verified snapshot: {exc}") from exc
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--start", default="1999-03-10", help="Inclusive ISO date")
+    parser.add_argument("--end", default=ny_today().isoformat(), help="Exclusive date; defaults to NY today")
+    parser.add_argument("--symbols", nargs="+", choices=tuple(SYMBOLS), default=list(SYMBOLS))
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--verify-only", action="store_true", help="Verify without downloading")
+    args = parser.parse_args(argv)
+    try:
+        if args.verify_only:
+            frames = load_verified_data(args.symbols, end=args.end, output_root=args.output)
+            print(f"Snapshot checks passed for {len(frames)} instruments (end exclusive: {args.end}).")
         else:
-            print(f"❌ 警告: {name} 下载返回了空数据。")
-    except Exception as e:
-        print(f"❌ 错误: {name} 下载失败，原因: {e}")
-
-# 检查最核心的 QQQ 是否下载成功
-if "QQQ" not in raw_data:
-    print("\n[重要提示]: QQQ 数据未能下载成功，请检查您的直连网络。")
-    exit()
-
-master_index = raw_data["QQQ"].index
-all_data = {name: df.reindex(master_index) for name, df in raw_data.items()}
+            run = create_snapshot(args.start, args.end, args.symbols, args.output)
+            print(f"All requested instruments passed. Snapshot: {run}")
+        print("Source: Yahoo Finance; consistency checked, not independently verified against an exchange.")
+        return 0
+    except Exception as exc:
+        print(f"Data preparation/verification FAILED: {exc}", file=sys.stderr)
+        return 1
 
 
-# ----------------- 优化后的局部修补拟合函数 -----------------
-
-def simulate_leveraged_etf(proxy_df, target_df, leverage, annual_decay=0.015):
-    """
-    自适应局部修补算法：
-    - 上市前：使用代理标的倒推拟合。
-    - 上市后：锁定真实值，若最新交易日出现临时 NaN，使用前一日真实价格 * 当日代理收益率补齐，彻底杜绝长期漂移。
-    """
-    daily_decay = (1 + annual_decay) ** (1 / 252) - 1
-    proxy_returns = proxy_df['Close'].pct_change().fillna(0)
-    simulated_returns = proxy_returns * leverage - daily_decay
-    
-    first_valid_date = target_df['Close'].first_valid_index()
-    first_valid_idx = proxy_df.index.get_loc(first_valid_date)
-    base_price = target_df.loc[first_valid_date, 'Close']
-    
-    # 复制真实价格序列
-    prices = target_df['Close'].copy()
-    
-    # 1. 倒推上市前的历史（Backward Simulation）
-    current_price = base_price
-    for i in range(first_valid_idx - 1, -1, -1):
-        date = proxy_df.index[i]
-        current_price = current_price / (1 + simulated_returns.iloc[i+1])
-        prices.loc[date] = current_price
-        
-    # 2. 局部修补上市后的 NaN（例如因延迟导致最新交易日无数据的临时修补）
-    for i in range(first_valid_idx + 1, len(proxy_df)):
-        date = proxy_df.index[i]
-        if pd.isna(prices.iloc[i]):
-            prices.iloc[i] = prices.iloc[i-1] * (1 + simulated_returns.iloc[i])
-            
-    return prices
-
-
-def simulate_sgov(bil_df, irx_df, sgov_df):
-    """
-    自适应局部修补算法模拟 SGOV
-    """
-    irx_daily_rate = (irx_df['Close'] / 100) / 360
-    irx_daily_rate = irx_daily_rate.ffill().fillna(0)
-    
-    # 1. 先拟合 BIL 价格
-    bil_first_date = bil_df['Close'].first_valid_index()
-    bil_first_idx = bil_df.index.get_loc(bil_first_date)
-    
-    bil_prices = bil_df['Close'].copy()
-    current_price = bil_df.loc[bil_first_date, 'Close']
-    for i in range(bil_first_idx - 1, -1, -1):
-        current_price = current_price / (1 + irx_daily_rate.iloc[i+1])
-        bil_prices.iloc[i] = current_price
-        
-    # 补齐 BIL 上市后的临时 NaN
-    for i in range(bil_first_idx + 1, len(bil_df)):
-        if pd.isna(bil_prices.iloc[i]):
-            bil_prices.iloc[i] = bil_prices.iloc[i-1] * (1 + irx_daily_rate.iloc[i])
-            
-    # 2. 拟合 SGOV 价格
-    sgov_first_date = sgov_df['Close'].first_valid_index()
-    sgov_first_idx = sgov_df.index.get_loc(sgov_first_date)
-    
-    sgov_prices = sgov_df['Close'].copy()
-    scale_factor = sgov_df.loc[sgov_first_date, 'Close'] / bil_prices.loc[sgov_first_date]
-    
-    # 倒推 SGOV 上市前价格
-    for i in range(sgov_first_idx - 1, -1, -1):
-        sgov_prices.iloc[i] = bil_prices.iloc[i] * scale_factor
-        
-    # 补齐 SGOV 上市后的临时 NaN (利用 BIL 的收益率)
-    bil_returns = bil_prices.pct_change().fillna(0)
-    for i in range(sgov_first_idx + 1, len(sgov_df)):
-        date = sgov_df.index[i]
-        if pd.isna(sgov_prices.iloc[i]):
-            sgov_prices.iloc[i] = sgov_prices.iloc[i-1] * (1 + bil_returns.iloc[i])
-            
-    return sgov_prices
-
-
-# ----------------- 执行合成 -----------------
-print("\n开始合成历史缺失数据...")
-
-# 1. SPY 自身历史已完整覆盖1999年至今，无需合成，直接使用原始下载数据即可。
-
-# 2. 拟合 QLD (2x QQQ)
-if "QLD" in all_data:
-    all_data["QLD"]['Close'] = simulate_leveraged_etf(all_data["QQQ"], all_data["QLD"], leverage=2.0)
-
-# 3. 拟合 TQQQ (3x QQQ)
-if "TQQQ" in all_data:
-    all_data["TQQQ"]['Close'] = simulate_leveraged_etf(all_data["QQQ"], all_data["TQQQ"], leverage=3.0)
-
-# 4. 拟合 SGOV (拼接 BIL 和 利率)
-if "SGOV" in all_data and "BIL" in all_data and "IRX" in all_data:
-    all_data["SGOV"]['Close'] = simulate_sgov(all_data["BIL"], all_data["IRX"], all_data["SGOV"])
-
-# 5. 拟合 VOO (与 SPY 同指数，上市前用 SPY 收益率倒推)
-if "VOO" in all_data and "SPY" in all_data:
-    all_data["VOO"]['Close'] = simulate_leveraged_etf(all_data["SPY"], all_data["VOO"], leverage=1.0, annual_decay=0.0)
-
-# 6. 拟合 VYM (VIVAX 代理，作为 SCHD 的早期回填基础)
-if "VYM" in all_data and "VIVAX" in all_data:
-    all_data["VYM"]['Close'] = simulate_leveraged_etf(all_data["VIVAX"], all_data["VYM"], leverage=1.0, annual_decay=0.0)
-
-# 7. 拟合 VTV (VIVAX 与 VTV 同属 Vanguard 价值指数，收益率可直接对齐)
-if "VTV" in all_data and "VIVAX" in all_data:
-    all_data["VTV"]['Close'] = simulate_leveraged_etf(all_data["VIVAX"], all_data["VTV"], leverage=1.0, annual_decay=0.0)
-
-# 8. 拟合 SCHD (上市前用 VYM 的大盘高股息收益倒推)
-if "SCHD" in all_data and "VYM" in all_data:
-    all_data["SCHD"]['Close'] = simulate_leveraged_etf(all_data["VYM"], all_data["SCHD"], leverage=1.0, annual_decay=0.0)
-
-# 9. 拟合 CGDV (上市前用 SCHD 的分红价值策略收益倒推)
-if "CGDV" in all_data and "SCHD" in all_data:
-    all_data["CGDV"]['Close'] = simulate_leveraged_etf(all_data["SCHD"], all_data["CGDV"], leverage=1.0, annual_decay=0.0)
-
-
-# ----------------- 4. 更新技术指标计算 -----------------
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=period-1, adjust=False).mean()
-    avg_loss = loss.ewm(com=period-1, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-# 调整目标 ETF 列表（VOO 保留以便更新历史文件，新增分红/价值类标的）
-target_etfs = ["QQQ", "SPY", "QLD", "TQQQ", "SGOV", "VIX", "VOO", "VTV", "SCHD", "CGDV", "KO"]
-print("\n开始计算更新后的技术指标 (RSI_6, RSI_14, MA_5, MA_10, MA_120, MA_200)...")
-
-for etf in target_etfs:
-    if etf not in all_data:
-        continue
-    df = all_data[etf].copy()
-    
-    # 填充缺失的 OHLV 字段使其结构完整
-    df['Open'] = df['Open'].combine_first(df['Close'])
-    df['High'] = df['High'].combine_first(df['Close'])
-    df['Low'] = df['Low'].combine_first(df['Close'])
-    df['Volume'] = df['Volume'].fillna(0)
-    
-    # 计算新指标
-    df['RSI_6'] = calculate_rsi(df['Close'], 6)
-    df['RSI_14'] = calculate_rsi(df['Close'], 14)
-    df['MA_5'] = df['Close'].rolling(window=5).mean()
-    df['MA_10'] = df['Close'].rolling(window=10).mean()
-    df['MA_120'] = df['Close'].rolling(window=120).mean()
-    df['MA_200'] = df['Close'].rolling(window=200).mean()
-    
-    # 剔除开头由于计算最长均线（MA200）需要的历史前置空白行
-    df.dropna(subset=['MA_200'], inplace=True)
-    
-    # 保存结果
-    file_path = f"data/{etf}_synthetic_daily.csv"
-    df.to_csv(file_path)
-    print(f"成功导出: {file_path} (数据范围: {df.index[0].strftime('%Y-%m-%d')} 至 {df.index[-1].strftime('%Y-%m-%d')})")
-
-print("\n数据准备与修正工作全部顺利完成！")
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,5 @@
+# Python 3.11+; direct dependency versions used for regression testing.
+yfinance==0.2.65
+exchange-calendars==4.11.1
+pandas==2.2.3
+numpy==2.3.5
