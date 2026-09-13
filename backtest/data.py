@@ -28,6 +28,11 @@ class Dataset:
     synthetic: pd.DataFrame
     observed_start: dict
     audit: dict
+    # Signal quotes are separate from dividend-reinvested valuation indices.
+    signal_prices: pd.DataFrame | None = None
+    signal_sources: pd.DataFrame | None = None
+    signal_synthetic: pd.DataFrame | None = None
+    signal_basis: str = 'adjusted_return_index_legacy'
 
 
 def sha_bytes(data):
@@ -245,11 +250,21 @@ def load_research(root, end, scenario):
 
 
 def indicators(data, cfg):
-    q = data.prices.QQQ
-    ratio = data.prices.VTV / q
-    out = pd.DataFrame({'QQQ': q, 'MA': q.rolling(cfg.ma_period).mean(),
+    prices = data.signal_prices if data.signal_prices is not None else data.prices
+    q, value = prices.QQQ, prices.VTV
+    ratio = value / q
+    lagged = ratio.shift(cfg.roc_period)
+    out = pd.DataFrame({'QQQ': q, 'VTV': value,
+                        'MA': q.rolling(cfg.ma_period).mean(),
                         'RSI': wilder_rsi(q, cfg.rsi_period),
-                        'ROC': ratio.pct_change(cfg.roc_period, fill_method=None) * 100})
+                        'ROC': (ratio / lagged - 1) * 100,
+                        'Ratio': ratio, 'ROCReferenceRatio': lagged,
+                        'ROCReferenceDate': pd.Series(prices.index, index=prices.index).shift(cfg.roc_period)})
+    out['ROCCrossDown'] = out.ROC.lt(0) & out.ROC.shift(1).ge(0)
+    out['ROCCrossUp'] = out.ROC.gt(0) & out.ROC.shift(1).le(0)
+    out['SignalPriceBasis'] = data.signal_basis
+    source = data.signal_sources if data.signal_sources is not None else data.sources
+    out['QQQSource'], out['VTVSource'] = source.QQQ, source.VTV
     out['ready'] = out[['QQQ', 'MA', 'RSI', 'ROC']].notna().all(axis=1)
     return out
 

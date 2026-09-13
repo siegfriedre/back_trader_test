@@ -13,3 +13,7 @@
 | `user_rules` | [原始描述的明确解释版](user_rules.md) |
 
 `user_rules` 不是声称用户未说清的规则只有这一种解释；其补充约定已经显式列出。C/D是建议的有约束版本，关键区别可通过配置和日志逐项复查。
+
+## 最新澄清版
+
+[bear_roc_bridge](bear_roc_bridge.md)：MA200下方ROC下穿零轴后先持有QQQ，收复MA后按ROC选择杠杆。需要独立的 `split_close` 信号数据；旧 `user_rules` 保留。

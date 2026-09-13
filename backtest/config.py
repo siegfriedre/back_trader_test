@@ -11,6 +11,10 @@ STRATEGIES = {
     'bull_bear_rsi': 'D：C + 有上限的熊市 RSI 抄底',
     'user_rules': '原始描述解释版（不是参数优化版）',
 }
+# Legacy default matrix stays reproducible; the clarified strategy is opt-in.
+DEFAULT_STRATEGIES = tuple(STRATEGIES)
+STRATEGIES['bear_roc_bridge'] = '澄清版：熊市ROC下穿先买QQQ，收复MA后再用杠杆'
+
 # (instrument, aggressive weight). All defensive bull states are 70% QQQ.
 # 70% QLD and 46 2/3% TQQQ both target ~1.4x initial daily exposure.
 PROFILES = {'tqqq70': ('TQQQ', .70), 'qld70': ('QLD', .70),
@@ -20,6 +24,7 @@ WINDOWS = ('post_tqqq', 'long_history', 'all_observed')
 
 @dataclass(frozen=True)
 class Config:
+    bridge_weight: float = .70  # explicit assumption: QQQ weight while below MA
     initial: float = 80000.0
     monthly: float = 1500.0
     cost_bps: float = 5.0  # all-in one-way commission + spread + slippage assumption
@@ -48,6 +53,8 @@ class Config:
         for key, value in asdict(self).items():
             if isinstance(value, (int, float)) and (isinstance(value, bool) or not math.isfinite(value)):
                 raise ValueError(f'Invalid finite number: {key}')
+        if not 0 < self.bridge_weight <= 1:
+            raise ValueError('Require 0 < bridge_weight <= 1; no implicit borrowing')
         if self.initial <= 0 or self.monthly < 0 or not 0 <= self.cost_bps < 1000:
             raise ValueError('Require positive capital, nonnegative contributions, and 0 <= cost_bps < 1000')
         for key in ('ma_period', 'rsi_period', 'roc_period', 'max_hold', 'signal_lag',

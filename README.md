@@ -2,6 +2,20 @@
 
 可审计的日线研究回测：初始80,000美元、每月1,500美元，对比 QQQ/杠杆ETF 趋势、相对强弱和 RSI 抄底策略。
 
+## 最新澄清：均线下ROC转负，先买QQQ
+
+新版策略名 **`bear_roc_bridge`**；旧 `user_rules` 保留作对照，不会悄悄改变旧75组默认实验。
+信号价和含分红复投收益已分开；新策略必须显式选择独立信号数据。
+
+```bash
+python -m pip install -r requirements.txt -r requirements-backtest.txt
+python prepare_signal_prices.py --end 2026-08-01
+python run_comparison.py --accept-legacy-adjusted --signal-source split_close --end 2026-08-01 --strategies bear_roc_bridge --profiles tqqq70 --windows post_tqqq --verbose-trades
+```
+
+默认过渡仓70% QQQ，直到恢复MA200再按ROC决定是否切70% TQQQ。4月1日收盘信号对应下一交易日收盘执行，不进行同日未来信息成交。
+完整规则和边界：[新版策略说明](docs/strategies/bear_roc_bridge.md)。单日TradingView截图校验通过不代表全历史同源；行情下载或核验失败会报错，不使用旧复权信号偷偷回退。
+
 ## 直接运行现有数据的策略对比
 
 Python 3.11/3.12，在本仓库目录：

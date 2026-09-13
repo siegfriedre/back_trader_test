@@ -18,7 +18,7 @@ import subprocess
 import sys
 from uuid import uuid4
 
-from backtest.config import Config, PROFILES, STRATEGIES, WINDOWS
+from backtest.config import Config, DEFAULT_STRATEGIES, PROFILES, STRATEGIES, WINDOWS
 from backtest.data import load_legacy, load_research, sha_bytes
 from backtest.engine import run
 from backtest.report import save_case, write_json, write_overview
@@ -52,12 +52,16 @@ def main(argv=None):
     parser.add_argument('--source', choices=['legacy', 'research'], default='legacy')
     parser.add_argument('--raw-dir', type=Path, default=ROOT / 'data/raw')
     parser.add_argument('--research-dir', type=Path, default=ROOT / 'data/research')
+    parser.add_argument('--signal-source', choices=['legacy_adjusted', 'split_close'], default='legacy_adjusted',
+                        help='split_close separates non-dividend-adjusted signal quotes from reinvested returns')
+    parser.add_argument('--signal-dir', type=Path, default=ROOT / 'data/signal_prices')
+    parser.add_argument('--bridge-weight', type=float, help='QQQ allocation below MA after ROC crossunder (default .70)')
     parser.add_argument('--scenario', default='base', choices=['base', 'higher_financing', 'broad_equity_proxy', 'combined_stress'])
     parser.add_argument('--accept-legacy-adjusted', action='store_true')
     parser.add_argument('--end', help='Exclusive date; default common last observation + 1 day for legacy')
     parser.add_argument('--start', help='Optional later start; does not discard earlier indicator warm-up')
     parser.add_argument('--windows', nargs='+', choices=WINDOWS, default=list(WINDOWS))
-    parser.add_argument('--strategies', nargs='+', choices=tuple(STRATEGIES), default=list(STRATEGIES))
+    parser.add_argument('--strategies', nargs='+', choices=tuple(STRATEGIES), default=list(DEFAULT_STRATEGIES))
     parser.add_argument('--profiles', nargs='+', choices=tuple(PROFILES), default=list(PROFILES))
     parser.add_argument('--initial', type=float)
     parser.add_argument('--monthly', type=float)
@@ -84,7 +88,7 @@ def main(argv=None):
         params = json.loads(args.config.read_text(encoding='utf-8-sig')) if args.config else {}
         if not isinstance(params, dict):
             raise ValueError('Configuration must be a JSON object')
-        for field in ('initial', 'monthly', 'cost_bps', 'signal_lag', 'confirm_days', 'rebalance', 'value_proxy', 'funding_spread'):
+        for field in ('initial', 'monthly', 'cost_bps', 'signal_lag', 'confirm_days', 'rebalance', 'value_proxy', 'funding_spread', 'bridge_weight'):
             if getattr(args, field) is not None:
                 params[field] = getattr(args, field)
         cfg = Config(**params)
@@ -105,6 +109,28 @@ def main(argv=None):
         log.warning('Research only: no live orders, no parameter search, no certified data.')
         data = (load_legacy(args.raw_dir, cfg, end=args.end, acknowledge=args.accept_legacy_adjusted)
                 if args.source == 'legacy' else load_research(args.research_dir, args.end, args.scenario))
+        if 'bear_roc_bridge' in args.strategies and args.signal_source != 'split_close':
+            raise ValueError('bear_roc_bridge requires --signal-source split_close; do not reuse legacy adjusted signals')
+        if args.signal_source == 'split_close':
+            from backtest.data import indicators
+            from backtest.signal_prices import attach_snapshot, tradingview_reference_check
+            before = indicators(data, cfg)
+            data = attach_snapshot(data, args.signal_dir)
+            after = indicators(data, cfg)
+            difference = before[['ROC', 'RSI', 'ROCCrossDown']].add_prefix('Adjusted_').join(
+                after[['ROC', 'RSI', 'ROCCrossDown']].add_prefix('SplitClose_'))
+            difference['Adjusted_AboveMA'] = before.QQQ > before.MA
+            difference['SplitClose_AboveMA'] = after.QQQ > after.MA
+            difference['ROCSignDiffers'] = before.ROC.lt(0) != after.ROC.lt(0)
+            difference.to_csv(out / 'signal_comparison.csv', index_label='Date', date_format='%Y-%m-%d', encoding='utf-8-sig')
+            reference = tradingview_reference_check(data, cfg)
+            write_json(out / 'tradingview_reference_check.json', reference)
+            data.audit['tradingview_reference_check'] = reference
+            write_json(out / 'data_audit.json', data.audit)
+            if reference['status'] == 'mismatch':
+                raise ValueError('Downloaded signals do not match the TradingView screenshot; see tradingview_reference_check.json. No trades published.')
+            log.info('Signal price basis: %s; one-day TradingView check: %s', data.signal_basis, reference['status'])
+
         write_json(out / 'data_audit.json', data.audit)
         # Persist the exact working returns, input signals and provenance for review.
         from backtest.data import indicators
@@ -114,6 +140,7 @@ def main(argv=None):
         panel.to_csv(out / 'input_panel.csv', index_label='Date', date_format='%Y-%m-%d', encoding='utf-8-sig')
         manifest = {'status': 'running', 'schema': 1, 'run_id': run_id, 'configuration': cfg.to_dict(),
                     'source_mode': data.audit['source_mode'], 'source_audit_sha256': sha_bytes((out / 'data_audit.json').read_bytes()),
+                    'signal_source': args.signal_source, 'signal_basis': data.signal_basis,
                     'execution': 'previous_close_signal_next_close_fractional_return_indices',
                     'windows': args.windows, 'strategies': args.strategies, 'profiles': args.profiles,
                     'start_override': args.start, 'end_exclusive': data.audit['effective_end_exclusive'],

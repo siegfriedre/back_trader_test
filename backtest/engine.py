@@ -13,6 +13,7 @@ import pandas as pd
 
 from .config import Config, PROFILES, STRATEGIES
 from .data import ASSETS, Dataset, indicators, window_start
+from .bridge import BRIDGE, bridge_states
 
 LEDGER = ASSETS + ('USD',)
 LEV = np.array([1., 3., 2., 0., 0.])
@@ -38,6 +39,8 @@ class Result:
 
 def signal_states(signal, cfg, strategy):
     """Sequential hysteresis/confirmation, computed before the execution lag."""
+    if strategy == 'bear_roc_bridge':
+        return bridge_states(signal, cfg)
     state, candidate, count, bull, tier = 'WAIT', '', 0, False, 'DEFENSIVE'
     states = []
     for row in signal.itertuples():
@@ -65,12 +68,14 @@ def signal_states(signal, cfg, strategy):
     return np.asarray(states)
 
 
-def base_weights(strategy, profile, state):
+def base_weights(strategy, profile, state, bridge_weight=.70):
     w = np.zeros(5)
     if state == 'WAIT':
         w[USD] = 1
     elif state == 'BEAR':
         w[SGOV] = 1
+    elif state == BRIDGE:
+        w[0], w[SGOV] = bridge_weight, 1 - bridge_weight
     elif strategy == 'hold_qqq' or state == 'DEFENSIVE':
         w[0], w[SGOV] = .70, .30
     else:
@@ -83,6 +88,8 @@ def run(data: Dataset, cfg: Config, strategy: str, profile: str, window: str,
         *, start=None, verbose=False) -> Result:
     if strategy not in STRATEGIES or profile not in PROFILES:
         raise ValueError('Unknown strategy/profile')
+    if strategy == 'bear_roc_bridge' and data.signal_prices is None:
+        raise ValueError('bear_roc_bridge requires separate signal prices: --signal-source split_close')
     sig = indicators(data, cfg)
     states = signal_states(sig, cfg, strategy)
     idx = data.prices.index
@@ -198,6 +205,15 @@ def run(data: Dataset, cfg: Config, strategy: str, profile: str, window: str,
                    'MA200': float(row.MA) if row is not None and pd.notna(row.MA) else None,
                    'RSI6': float(row.RSI) if row is not None and pd.notna(row.RSI) else None,
                    'ROC35_pct': float(row.ROC) if row is not None and pd.notna(row.ROC) else None}
+        for field in ('VTV', 'Ratio', 'ROCReferenceRatio', 'ROCReferenceDate',
+                      'ROCCrossDown', 'ROCCrossUp', 'SignalPriceBasis', 'QQQSource', 'VTVSource'):
+            value = row.get(field) if row is not None else None
+            if isinstance(value, pd.Timestamp):
+                value = str(value.date())
+            elif isinstance(value, np.generic):
+                value = value.item()
+            context[field] = value if value is not None and pd.notna(value) else None
+
         if i == first:
             event('INITIAL_CAPITAL', amount=cfg.initial)
         before_return = aggregate()
@@ -243,11 +259,21 @@ def run(data: Dataset, cfg: Config, strategy: str, profile: str, window: str,
                 lots.clear()  # reclassification; only NET instrument trades pay costs
             current_state = target_state
             event('STATE_CHANGE', before=old, after=current_state)
-            rebalance(base_weights(strategy, profile, current_state), 'INITIAL_ALLOCATION' if not invested else 'REGIME_REBALANCE')
+            reason = 'REGIME_REBALANCE'
+            if current_state == BRIDGE:
+                event('BEAR_ROC_QQQ_ENTRY', bridge_weight=cfg.bridge_weight,
+                      detail='Below MA with fresh ROC crossunder; hold unleveraged QQQ until MA recovery.')
+                reason = 'BEAR_ROC_QQQ_REBALANCE'
+            elif old == BRIDGE:
+                event('BEAR_ROC_QQQ_EXIT', next_state=current_state,
+                      detail='MA recovered; use current ROC sign to choose leverage.')
+                reason = 'BRIDGE_TO_BULL_REBALANCE'
+            rebalance(base_weights(strategy, profile, current_state, cfg.bridge_weight),
+                      'INITIAL_ALLOCATION' if not invested else reason)
             if current_state != 'WAIT':
                 invested = True
         if current_state != 'WAIT':
-            w = base_weights(strategy, profile, current_state)
+            w = base_weights(strategy, profile, current_state, cfg.bridge_weight)
             if strategy in ('bull_rsi', 'bull_bear_rsi'):
                 for lot in list(lots):
                     if row.RSI >= cfg.exit_rsi or i - lot['entry_i'] >= cfg.max_hold:
@@ -265,15 +291,17 @@ def run(data: Dataset, cfg: Config, strategy: str, profile: str, window: str,
             trigger = crossed and armed
             if trigger:
                 armed = False
-            enabled = strategy in ('bull_rsi', 'bull_bear_rsi', 'user_rules')
+            enabled = strategy in ('bull_rsi', 'bull_bear_rsi', 'user_rules', 'bear_roc_bridge')
             if trigger and enabled:
                 if changed:
                     event('DIP_SKIPPED_STATE_CHANGE')
+                elif current_state == BRIDGE:
+                    event('DIP_SKIPPED_BRIDGE_BASE', detail='QQQ bridge already allocated; no leveraged RSI overlay below MA.')
                 elif current_state == 'BEAR' and strategy == 'bull_rsi':
                     event('DIP_SKIPPED_BEAR_DISABLED')
                 else:
                     equity = float(aggregate().sum())
-                    original = strategy == 'user_rules'
+                    original = strategy in ('user_rules', 'bear_roc_bridge')
                     asset = ('QQQ' if current_state == 'BEAR' else
                              PROFILES[profile][0] if original or current_state == 'AGGRESSIVE' else 'QQQ')
                     a = LEDGER.index(asset)
@@ -298,9 +326,14 @@ def run(data: Dataset, cfg: Config, strategy: str, profile: str, window: str,
         if not np.isfinite(held).all() or equity <= 0 or held.min() < -1e-8 * equity:
             raise ValueError('Portfolio insolvency/nonfinite values/negative cash; no implicit borrowing')
         nav = equity / shares
-        signal_proxy = bool(data.synthetic.VTV.iloc[max(0, k - cfg.roc_period):k + 1].any()) if k >= 0 else False
+        signal_flags = data.signal_synthetic if data.signal_synthetic is not None else data.synthetic
+        signal_proxy = bool(signal_flags.VTV.iloc[max(0, k - cfg.roc_period):k + 1].any()) if k >= 0 else False
         days.append({'Date': date, 'Equity': equity, 'Contributed': total_in, 'Contribution': contribution,
                      'UnitNAV': nav, 'State': current_state, 'SignalDate': context['signal_date'],
+                     'SignalQQQ': context['QQQ'], 'SignalVTV': context['VTV'],
+                     'SignalPriceBasis': context['SignalPriceBasis'],
+                     'ROCReferenceDate': context['ROCReferenceDate'],
+                     'ROCCrossDown': context['ROCCrossDown'],
                      'MA200': context['MA200'], 'RSI6': context['RSI6'], 'ROC35_pct': context['ROC35_pct'],
                      'ApproxDailyExposure': float(held @ LEV / equity),
                      'SyntheticReturnExposure': synthetic_weight, 'ProxyInROCSignal': signal_proxy,

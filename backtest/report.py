@@ -150,6 +150,7 @@ def save_case(result, root):
                'cost', 'weight_before', 'weight_after', 'equity_before', 'equity_after', 'reason',
                'QQQ', 'MA200', 'RSI6', 'ROC35_pct', 'price_kind', 'price_index', 'return_source',
                'synthetic_return_on_execution_day']
+    columns += sorted({k for t in result.trades for k in t} - set(columns))
     pd.DataFrame(result.trades, columns=columns).to_csv(folder / 'trades.csv', index=False, encoding='utf-8-sig')
     with (folder / 'events.jsonl').open('w', encoding='utf-8') as stream:
         for row in result.events:
@@ -166,7 +167,8 @@ def comparison_pairs(summary):
     by_key = {(r['window'], r['strategy'], r['profile']): r for r in summary}
     rows = []
     pairs = [('hold_leveraged', 'ma200'), ('ma200', 'ma_roc'), ('ma_roc', 'bull_rsi'),
-             ('bull_rsi', 'bull_bear_rsi'), ('user_rules', 'bull_bear_rsi')]
+             ('bull_rsi', 'bull_bear_rsi'), ('user_rules', 'bull_bear_rsi'),
+             ('user_rules', 'bear_roc_bridge')]
     for (window, strategy, profile), right in by_key.items():
         for left_s, right_s in pairs:
             left = by_key.get((window, left_s, profile))
@@ -188,6 +190,7 @@ def write_overview(root, summary, annual, crisis, metadata):
     warning = '研究回测，不是未来收益承诺。旧数据模式不等于行情认证；合成收益不是基金真实历史。'
     lines = ['# 策略对比结果', '', warning, '', '## 数据与执行口径', '',
              f"- 数据模式：`{metadata['source_mode']}`；结果由本地实际输入计算，文件哈希见 manifest。",
+             f"- 信号价格口径：`{metadata.get('signal_basis', 'adjusted_return_index_legacy')}`；收益仍计入分红复投近似，不重复增加现金。",
              '- 信号滞后执行；日终定投；分数金额持仓；成本按买卖单边计算；不含税。',
              '- 末日按市值估值，不强制平仓；年化收益、回撤用剔除定投影响的单位净值。',
              '- long_history 的所有策略先以无息 USD 等待指标预热；没有回填 MA200。',
