@@ -1,0 +1,47 @@
+name: Signal-price and bear-ROC bridge review
+on:
+  push:
+    branches: [feat/research-preinception-data]
+    paths:
+      - 'backtest/**'
+      - 'tests/**'
+      - 'prepare_signal_prices.py'
+      - 'run_comparison.py'
+      - '.github/workflows/signal-bridge.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Archive exact tracked source and existing inputs for reproducibility
+        run: git archive --format=zip --output=repo-source.zip HEAD
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-backtest.txt
+      - name: Regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Prepare explicitly unadjusted-for-dividends signal quotes
+        if: ${{ hashFiles('prepare_signal_prices.py') != '' }}
+        run: python prepare_signal_prices.py --end 2026-08-01
+      - name: Compare clarified bridge against the previous rules
+        if: ${{ hashFiles('prepare_signal_prices.py') != '' }}
+        run: python run_comparison.py --accept-legacy-adjusted --signal-source split_close --end 2026-08-01 --strategies user_rules bear_roc_bridge --profiles tqqq70 qld70 --output results/bridge
+      - name: Publish source, quote provenance, and results (failure manifests included)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: signal-bridge-${{ github.sha }}
+          path: |
+            repo-source.zip
+            data/signal_prices/
+            results/bridge/
+          retention-days: 14
+          if-no-files-found: error
